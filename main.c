@@ -21,9 +21,11 @@
 #include <avr/boot.h>
 #include <avr/pgmspace.h>
 
+#define BOOTLOADER_START		0x7C00 
+
 #define VERSION_STRING          "TWIBOOT v3.2"
-#define EEPROM_SUPPORT          1
-#define LED_SUPPORT             1
+#define EEPROM_SUPPORT          0
+#define LED_SUPPORT             0
 
 #ifndef USE_CLOCKSTRETCH
 #define USE_CLOCKSTRETCH        0
@@ -34,34 +36,16 @@
 #endif
 
 #ifndef TWI_ADDRESS
-#define TWI_ADDRESS             0x29
+#define TWI_ADDRESS             0x5d
 #endif
 
 #define F_CPU                   8000000ULL
 #define TIMER_DIVISOR           1024
 #define TIMER_IRQFREQ_MS        25
-#define TIMEOUT_MS              1000
+#define TIMEOUT_MS              5000
 
 #define TIMER_MSEC2TICKS(x)     ((x * F_CPU) / (TIMER_DIVISOR * 1000ULL))
 #define TIMER_MSEC2IRQCNT(x)    (x / TIMER_IRQFREQ_MS)
-
-#if (LED_SUPPORT)
-#define LED_INIT()              DDRB = ((1<<PORTB4) | (1<<PORTB5))
-#define LED_RT_ON()             PORTB |= (1<<PORTB4)
-#define LED_RT_OFF()            PORTB &= ~(1<<PORTB4)
-#define LED_GN_ON()             PORTB |= (1<<PORTB5)
-#define LED_GN_OFF()            PORTB &= ~(1<<PORTB5)
-#define LED_GN_TOGGLE()         PORTB ^= (1<<PORTB5)
-#define LED_OFF()               PORTB = 0x00
-#else
-#define LED_INIT()
-#define LED_RT_ON()
-#define LED_RT_OFF()
-#define LED_GN_ON()
-#define LED_GN_OFF()
-#define LED_GN_TOGGLE()
-#define LED_OFF()
-#endif /* LED_SUPPORT */
 
 #if !defined(TWCR) && defined(USICR)
 #define USI_PIN_INIT()          { PORTB |= ((1<<PORTB0) | (1<<PORTB2)); \
@@ -70,10 +54,6 @@
 #define USI_PIN_SDA_INPUT()     DDRB &= ~(1<<PORTB0)
 #define USI_PIN_SDA_OUTPUT()    DDRB |= (1<<PORTB0)
 #define USI_PIN_SCL()           (PINB & (1<<PINB2))
-
-#if (USE_CLOCKSTRETCH == 0)
-#error "USI peripheral requires enabled USE_CLOCKSTRETCH"
-#endif
 
 #define USI_STATE_MASK          0x0F
 #define USI_STATE_IDLE          0x00    /* wait for Start Condition */
@@ -90,27 +70,11 @@
 #define USI_ENABLE_SCL_HOLD     0x40    /* Hold SCL low after clock overflow */
 #endif /* !defined(TWCR) && defined(USICR) */
 
-#if (VIRTUAL_BOOT_SECTION)
-/* unused vector to store application start address */
-#define APPVECT_NUM             EE_RDY_vect_num
-
-/* each vector table entry is a 2byte RJMP opcode */
-#define RSTVECT_ADDR            0x0000
-#define APPVECT_ADDR            (APPVECT_NUM * 2)
-#define RSTVECT_PAGE_OFFSET     (RSTVECT_ADDR % SPM_PAGESIZE)
-#define APPVECT_PAGE_OFFSET     (APPVECT_ADDR % SPM_PAGESIZE)
-
-/* create RJMP opcode for the vector table */
-#define OPCODE_RJMP(addr)       (((addr) & 0x0FFF) | 0xC000)
-
-#elif (!defined(ASRE) && !defined (RWWSRE))
-#error "Device without bootloader section requires VIRTUAL_BOOT_SECTION"
-#endif
-
 /* SLA+R */
 #define CMD_WAIT                0x00
 #define CMD_READ_VERSION        0x01
 #define CMD_ACCESS_MEMORY       0x02
+#define CMD_GET_VERSION			0x03
 /* internal mappings */
 #define CMD_ACCESS_CHIPINFO     (0x10 | CMD_ACCESS_MEMORY)
 #define CMD_ACCESS_FLASH        (0x20 | CMD_ACCESS_MEMORY)
@@ -171,64 +135,36 @@ const static uint8_t chipinfo[8] = {
     (BOOTLOADER_START >> 8) & 0xFF,
     BOOTLOADER_START & 0xFF,
 
-#if (EEPROM_SUPPORT)
-    ((E2END +1) >> 8 & 0xFF),
-    (E2END +1) & 0xFF
-#else
     0x00, 0x00
-#endif
 };
 
 static uint8_t boot_timeout = TIMER_MSEC2IRQCNT(TIMEOUT_MS);
+static uint8_t bcnt = 0u;
+static uint8_t bcnt_read = 16u;
 static uint8_t cmd = CMD_WAIT;
 
 /* flash buffer */
 static uint8_t buf[SPM_PAGESIZE];
 static uint16_t addr;
+static uint16_t read_addr = 0;
 
-#if (VIRTUAL_BOOT_SECTION)
-/* reset/application vectors received from host, needed for verify read */
-static uint8_t rstvect_save[2];
-static uint8_t appvect_save[2];
-#endif /* (VIRTUAL_BOOT_SECTION) */
+
 
 /* *************************************************************************
  * write_flash_page
  * ************************************************************************* */
 static void write_flash_page(void)
 {
+	
     uint16_t pagestart = addr;
     uint8_t size = SPM_PAGESIZE;
     uint8_t *p = buf;
-
-#if (VIRTUAL_BOOT_SECTION)
-    if (pagestart == (RSTVECT_ADDR & ~(SPM_PAGESIZE -1)))
-    {
-        /* save original vectors for verify read */
-        rstvect_save[0] = buf[RSTVECT_PAGE_OFFSET];
-        rstvect_save[1] = buf[RSTVECT_PAGE_OFFSET + 1];
-        appvect_save[0] = buf[APPVECT_PAGE_OFFSET];
-        appvect_save[1] = buf[APPVECT_PAGE_OFFSET + 1];
-
-        /* replace reset vector with jump to bootloader address */
-        uint16_t rst_vector = OPCODE_RJMP(BOOTLOADER_START -1);
-        buf[RSTVECT_PAGE_OFFSET] = (rst_vector & 0xFF);
-        buf[RSTVECT_PAGE_OFFSET + 1] = (rst_vector >> 8) & 0xFF;
-
-        /* replace application vector with jump to original reset vector */
-        uint16_t app_vector = rstvect_save[0] | (rstvect_save[1] << 8);
-        app_vector = OPCODE_RJMP(app_vector - APPVECT_NUM);
-
-        buf[APPVECT_PAGE_OFFSET] = (app_vector & 0xFF);
-        buf[APPVECT_PAGE_OFFSET + 1] = (app_vector >> 8) & 0xFF;
-    }
-#endif /* (VIRTUAL_BOOT_SECTION) */
-
+	
     if (pagestart < BOOTLOADER_START)
     {
         boot_page_erase(pagestart);
         boot_spm_busy_wait();
-
+		
         do {
             uint16_t data = *p++;
             data |= *p++ << 8;
@@ -238,76 +174,32 @@ static void write_flash_page(void)
             size -= 2;
         } while (size);
 
+
         boot_page_write(pagestart);
         boot_spm_busy_wait();
+		
+
+
 
 #if defined (ASRE) || defined (RWWSRE)
         /* only required for bootloader section */
         boot_rww_enable();
 #endif
+		
+		
+		
+		// Reset for the next page for 0x80
+		bcnt = 4u; 
+		cmd = CMD_ACCESS_FLASH;
+		
     }
 } /* write_flash_page */
-
-
-#if (EEPROM_SUPPORT)
-/* *************************************************************************
- * read_eeprom_byte
- * ************************************************************************* */
-static uint8_t read_eeprom_byte(uint16_t address)
-{
-    EEARL = address;
-    EEARH = (address >> 8);
-    EECR |= (1<<EERE);
-
-    return EEDR;
-} /* read_eeprom_byte */
-
-
-/* *************************************************************************
- * write_eeprom_byte
- * ************************************************************************* */
-static void write_eeprom_byte(uint8_t val)
-{
-    EEARL = addr;
-    EEARH = (addr >> 8);
-    EEDR = val;
-    addr++;
-
-#if defined (EEWE)
-    EECR |= (1<<EEMWE);
-    EECR |= (1<<EEWE);
-#elif defined (EEPE)
-    EECR |= (1<<EEMPE);
-    EECR |= (1<<EEPE);
-#else
-#error "EEWE/EEPE not defined"
-#endif
-
-    eeprom_busy_wait();
-} /* write_eeprom_byte */
-
-
-#if (USE_CLOCKSTRETCH == 0)
-/* *************************************************************************
- * write_eeprom_buffer
- * ************************************************************************* */
-static void write_eeprom_buffer(uint8_t size)
-{
-    uint8_t *p = buf;
-
-    while (size--)
-    {
-        write_eeprom_byte(*p++);
-    }
-} /* write_eeprom_buffer */
-#endif /* (USE_CLOCKSTRETCH == 0) */
-#endif /* EEPROM_SUPPORT */
 
 
 /* *************************************************************************
  * TWI_data_write
  * ************************************************************************* */
-static uint8_t TWI_data_write(uint8_t bcnt, uint8_t data)
+static uint8_t TWI_data_write(uint8_t data)
 {
     uint8_t ack = 0x01;
 
@@ -318,12 +210,17 @@ static uint8_t TWI_data_write(uint8_t bcnt, uint8_t data)
             {
                 case CMD_SWITCH_APPLICATION:
                 case CMD_ACCESS_MEMORY:
+				case CMD_GET_VERSION:
                     /* no break */
 
                 case CMD_WAIT:
                     /* abort countdown */
                     boot_timeout = 0;
                     cmd = data;
+					//This will ensure Bootloader version read to work (cmd "Show bootloader version").
+					//bcnt = 0u;
+					// This will ensure that go to read chipingo
+					bcnt ++ ;
                     break;
 
                 default:
@@ -341,6 +238,7 @@ static uint8_t TWI_data_write(uint8_t bcnt, uint8_t data)
                     if (data == BOOTTYPE_APPLICATION)
                     {
                         cmd = CMD_BOOT_APPLICATION;
+						bcnt++;
                     }
 
                     ack = 0x00;
@@ -350,23 +248,28 @@ static uint8_t TWI_data_write(uint8_t bcnt, uint8_t data)
                     if (data == MEMTYPE_CHIPINFO)
                     {
                         cmd = CMD_ACCESS_CHIPINFO;
+						bcnt++;
+						
                     }
                     else if (data == MEMTYPE_FLASH)
                     {
                         cmd = CMD_ACCESS_FLASH;
+						bcnt++;
                     }
-#if (EEPROM_SUPPORT)
-                    else if (data == MEMTYPE_EEPROM)
-                    {
-                        cmd = CMD_ACCESS_EEPROM;
-                    }
-#endif /* (EEPROM_SUPPORT) */
                     else
                     {
                         ack = 0x00;
                     }
                     break;
-
+				
+					
+				case CMD_GET_VERSION:
+					cmd = CMD_READ_VERSION;
+					ack = 0x00;
+					bcnt++;
+					break;
+				
+				
                 default:
                     ack = 0x00;
                     break;
@@ -377,52 +280,41 @@ static uint8_t TWI_data_write(uint8_t bcnt, uint8_t data)
         case 3:
             addr <<= 8;
             addr |= data;
-            break;
+			bcnt++;
+			break;
 
         default:
             switch (cmd)
             {
-#if (EEPROM_SUPPORT)
-#if (USE_CLOCKSTRETCH)
-                case CMD_ACCESS_EEPROM:
-                    write_eeprom_byte(data);
-                    break;
-#else
-                case CMD_ACCESS_EEPROM:
-                    cmd = CMD_WRITE_EEPROM_PAGE;
-                    /* fall through */
-
-                case CMD_WRITE_EEPROM_PAGE:
-#endif /* (USE_CLOCKSTRETCH) */
-#endif /* (EEPROM_SUPPORT) */
-                case CMD_ACCESS_FLASH:
-                {
-                    uint8_t pos = bcnt -4;
-
+                case CMD_ACCESS_FLASH:			
+					{
+					//cmd = CMD_WRITE_FLASH_PAGE;
+                    uint8_t pos = bcnt - 4;
                     buf[pos] = data;
                     if (pos >= (SPM_PAGESIZE -1))
                     {
                         if (cmd == CMD_ACCESS_FLASH)
                         {
-#if (USE_CLOCKSTRETCH)
-                            write_flash_page();
-#else
                             cmd = CMD_WRITE_FLASH_PAGE;
-#endif
                         }
 
                         ack = 0x00;
                     }
-                    break;
-                }
+					
+					break;
+					}					
+                
 
                 default:
                     ack = 0x00;
-                    break;
+					break;
             }
+			bcnt++;
             break;
     }
 
+	//Increment bcnt.
+	//bcnt++;
     return ack;
 } /* TWI_data_write */
 
@@ -430,62 +322,48 @@ static uint8_t TWI_data_write(uint8_t bcnt, uint8_t data)
 /* *************************************************************************
  * TWI_data_read
  * ************************************************************************* */
-static uint8_t TWI_data_read(uint8_t bcnt)
+static uint8_t TWI_data_read(void)
 {
     uint8_t data;
 
     switch (cmd)
     {
         case CMD_READ_VERSION:
-            bcnt %= sizeof(info);
-            data = info[bcnt];
+            bcnt_read %= sizeof(info);
+            data = info[bcnt_read];
             break;
 
         case CMD_ACCESS_CHIPINFO:
-            bcnt %= sizeof(chipinfo);
-            data = chipinfo[bcnt];
+            bcnt_read %= sizeof(chipinfo);
+            data = chipinfo[bcnt_read];
             break;
 
-        case CMD_ACCESS_FLASH:
-            switch (addr)
-            {
-/* return cached values for verify read */
-#if (VIRTUAL_BOOT_SECTION)
-                case RSTVECT_ADDR:
-                    data = rstvect_save[0];
-                    break;
-
-                case (RSTVECT_ADDR + 1):
-                    data = rstvect_save[1];
-                    break;
-
-                case APPVECT_ADDR:
-                    data = appvect_save[0];
-                    break;
-
-                case (APPVECT_ADDR + 1):
-                    data = appvect_save[1];
-                    break;
-#endif /* (VIRTUAL_BOOT_SECTION) */
-
-                default:
-                    data = pgm_read_byte_near(addr);
-                    break;
-            }
-
-            addr++;
+        case CMD_ACCESS_FLASH: 
+						
+			data = pgm_read_byte_near(read_addr);          
+			read_addr++;			
             break;
-
-#if (EEPROM_SUPPORT)
-        case CMD_ACCESS_EEPROM:
-            data = read_eeprom_byte(addr++);
-            break;
-#endif /* (EEPROM_SUPPORT) */
 
         default:
             data = 0xFF;
             break;
     }
+
+	//Increment bcnt.
+	bcnt_read++;
+
+	/*
+	//This will ensure Bootloader version read to work (cmd "Show bootloader version").
+	if(16u == bcnt)
+	{
+		//Reset bcnt in case it reached 16 bytes.
+		bcnt = 0u;
+	}
+	else
+	{
+		//Do nothing with bcnt, keep sending FBL version data.
+	}
+	*/
 
     return data;
 } /* TWI_data_read */
@@ -497,20 +375,18 @@ static uint8_t TWI_data_read(uint8_t bcnt)
  * ************************************************************************* */
 static void TWI_vect(void)
 {
-    static uint8_t bcnt;
     uint8_t control = TWCR;
+
 
     switch (TWSR & 0xF8)
     {
         /* SLA+W received, ACK returned -> receive data and ACK */
         case 0x60:
-            bcnt = 0;
-            LED_RT_ON();
             break;
 
         /* prev. SLA+W, data received, ACK returned -> receive data and ACK */
         case 0x80:
-            if (TWI_data_write(bcnt++, TWDR) == 0x00)
+            if (TWI_data_write(TWDR) == 0x00)
             {
                 /* the ACK returned by TWI_data_write() is not for the current
                  * data in TWDR, but for the next byte received
@@ -521,53 +397,36 @@ static void TWI_vect(void)
 
         /* SLA+R received, ACK returned -> send data */
         case 0xA8:
-            bcnt = 0;
-            LED_RT_ON();
             /* fall through */
 
         /* prev. SLA+R, data sent, ACK returned -> send data */
         case 0xB8:
-            TWDR = TWI_data_read(bcnt++);
+            TWDR = TWI_data_read();
             break;
 
         /* prev. SLA+W, data received, NACK returned -> IDLE */
         case 0x88:
-            TWI_data_write(bcnt++, TWDR);
+            TWI_data_write(TWDR);
             /* fall through */
 
         /* STOP or repeated START -> IDLE */
         case 0xA0:
-#if (USE_CLOCKSTRETCH == 0)
-            if ((cmd == CMD_WRITE_FLASH_PAGE)
-#if (EEPROM_SUPPORT)
-                || (cmd == CMD_WRITE_EEPROM_PAGE)
-#endif
-               )
-            {
-                /* disable ACK for now, re-enable after page write */
-                control &= ~(1<<TWEA);
-                TWCR = (1<<TWINT) | control;
+		
+		if (cmd == CMD_WRITE_FLASH_PAGE)
+			{
+			/* disable ACK for now, re-enable after page write */
+			control &= ~(1<<TWEA);
+			TWCR = (1<<TWINT) | control;			
+			write_flash_page();			
+			}
 
-#if (EEPROM_SUPPORT)
-                if (cmd == CMD_WRITE_EEPROM_PAGE)
-                {
-                    write_eeprom_buffer(bcnt -4);
-                }
-                else
-#endif /* (EEPROM_SUPPORT) */
-                {
-                    write_flash_page();
-                }
-            }
-#endif /* (USE_CLOCKSTRETCH) */
-
-            bcnt = 0;
-            /* fall through */
+		
+        /* fall through */
+			
 
         /* prev. SLA+R, data sent, NACK returned -> IDLE */
         case 0xC0:
-            LED_RT_OFF();
-            control |= (1<<TWEA);
+			control |= (1<<TWEA);
             break;
 
         /* illegal state(s) -> reset hardware */
@@ -605,7 +464,6 @@ static void usi_statemachine(uint8_t usisr)
     /* Stop Condition detected */
     if (usisr & (1<<USIPF))
     {
-        LED_RT_OFF();
         usi_state = USI_STATE_IDLE;
         state = USI_STATE_IDLE;
     }
@@ -622,14 +480,12 @@ static void usi_statemachine(uint8_t usisr)
         /* SLA+W received -> send ACK */
         if (data == ((TWI_ADDRESS<<1) | 0x00))
         {
-            LED_RT_ON();
             usi_state = USI_STATE_SLAW_ACK | USI_WAIT_FOR_ACK | USI_ENABLE_SDA_OUTPUT | USI_ENABLE_SCL_HOLD;
             USIDR = 0x00;
         }
         /* SLA+R received -> send ACK */
         else if (data == ((TWI_ADDRESS<<1) | 0x01))
         {
-            LED_RT_ON();
             usi_state = USI_STATE_SLAR_ACK | USI_WAIT_FOR_ACK | USI_ENABLE_SDA_OUTPUT | USI_ENABLE_SCL_HOLD;
             USIDR = 0x00;
         }
@@ -738,9 +594,6 @@ static void TIMER0_OVF_vect(void)
     /* restart timer */
     TCNT0 = 0xFF - TIMER_MSEC2TICKS(TIMER_IRQFREQ_MS);
 
-    /* blink LED while running */
-    LED_GN_TOGGLE();
-
     /* count down for app-boot */
     if (boot_timeout > 1)
     {
@@ -754,11 +607,7 @@ static void TIMER0_OVF_vect(void)
 } /* TIMER0_OVF_vect */
 
 
-#if (VIRTUAL_BOOT_SECTION)
-static void (*jump_to_app)(void) __attribute__ ((noreturn)) = (void*)APPVECT_ADDR;
-#else
 static void (*jump_to_app)(void) __attribute__ ((noreturn)) = (void*)0x0000;
-#endif
 
 
 /* *************************************************************************
@@ -806,16 +655,6 @@ void disable_wdt_timer(void)
 int main(void) __attribute__ ((OS_main, section (".init9")));
 int main(void)
 {
-    LED_INIT();
-    LED_GN_ON();
-
-#if (VIRTUAL_BOOT_SECTION)
-	/* load current values (for reading flash) */
-    rstvect_save[0] = pgm_read_byte_near(RSTVECT_ADDR);
-    rstvect_save[1] = pgm_read_byte_near(RSTVECT_ADDR + 1);
-    appvect_save[0] = pgm_read_byte_near(APPVECT_ADDR);
-    appvect_save[1] = pgm_read_byte_near(APPVECT_ADDR + 1);
-#endif /* (VIRTUAL_BOOT_SECTION) */
 
     /* timer0: running with F_CPU/1024 */
 #if defined (TCCR0)
@@ -885,14 +724,6 @@ int main(void)
 #error "TCCR0(B) not defined"
 #endif
 
-    LED_OFF();
-
-#if (LED_SUPPORT)
-    uint16_t wait = 0x0000;
-    do {
-        __asm volatile ("nop");
-    } while (--wait);
-#endif /* (LED_SUPPORT) */
 
     jump_to_app();
 } /* main */
